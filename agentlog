@@ -1,0 +1,960 @@
+#!/usr/bin/python3
+# (mise shim ではなく OS の python3 を直接使う。hook 実行時に mise が別バージョンを
+#  自動 install し始めるのを避けるため。stdlib のみ。検証は 3.12、3.9 以上を想定)
+"""AI エージェント (Claude Code / Codex) のセッション計測ログ。
+
+エージェントが既に残している transcript (Claude: ~/.claude/projects/**/<session>.jsonl、
+Codex: ~/.codex/sessions/**/rollout-*.jsonl) をセッション終了後に 1 回読み、
+1 セッション 1 レコードの jsonl (~/.local/share/agentlog/sessions.jsonl) に集約する。
+セッション本体のトークンは一切使わない (LLM 要約はしない)。
+
+使い方:
+  agentlog hook                 # SessionEnd hook から呼ぶ (stdin に hook JSON)
+  agentlog collect <transcript>...  [--stdout]
+  agentlog scan [--since 7d]    # 両エージェントの transcript を走査して未集計分を取り込む
+  agentlog show [--since 7d] [--agent claude|codex] [--json] [-n 30]
+  agentlog stats [--since 30d]  # 期間集計 (トークン・ツール・原始コマンド)
+  agentlog install-hook         # ~/.claude/settings.json / ~/.codex/hooks.json に hook を冪等登録
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCHEMA = 2  # 2: origin / launcher / launch_via を追加
+HOME = Path.home()
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "agentlog"
+STORE = DATA_DIR / "sessions.jsonl"
+CLAUDE_PROJECTS = HOME / ".claude/projects"
+CODEX_SESSIONS = HOME / ".codex/sessions"
+HOOK_COMMAND = str(HOME / ".local/bin/agentlog") + " hook"
+
+INSTRUCTION_LEN = 200
+TOP_COMMANDS = 15
+
+# 原始コマンドの頻度を取るとき、先頭語から剥がす wrapper 群
+CMD_WRAPPERS = {"sudo", "time", "env", "command", "builtin", "nohup", "exec", "nice", "ionice", "timeout"}
+CMD_SKIP = {"", "then", "do", "fi", "done", "else", "elif", "for", "if", "while", "until", "in", "{", "}", "(", ")", "!", "["}
+RE_SKILL_MD = re.compile(r"skills/([^/\s'\"]+)/SKILL\.md")
+RE_GIT_COMMIT_OUT = re.compile(r"^\[([^\s\]]+) (?:\(root-commit\) )?([0-9a-f]{7,40})\] (.+)$", re.M)
+RE_ISSUE = re.compile(r"(?<![\w/])#(\d{1,6})\b|/-/issues/(\d+)|\bissue(?:s)?\s+(?:view|note|update|close)\s+(\d+)")
+RE_MR = re.compile(r"(?<![\w/])!(\d{1,6})\b|/-/merge_requests/(\d+)|\bmr\s+(?:view|note|update|merge|approve)\s+(\d+)")
+RE_BRANCH_NUM = re.compile(r"^[a-z]+/(\d+)-")
+RE_CODEX_CMD = re.compile(r'"cmd"\s*:\s*("(?:[^"\\]|\\.)*")')
+RE_PATCH_FILE = re.compile(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", re.M)
+
+
+# ---------------------------------------------------------------- 共通ユーティリティ
+
+
+def log(msg: str) -> None:
+    print(f"agentlog: {msg}", file=sys.stderr)
+
+
+def iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def parse_since(spec: str | None) -> datetime | None:
+    if not spec:
+        return None
+    m = re.fullmatch(r"(\d+)([dhm])", spec)
+    if not m:
+        return datetime.fromisoformat(spec).astimezone(timezone.utc)
+    n, unit = int(m.group(1)), m.group(2)
+    delta = {"d": timedelta(days=n), "h": timedelta(hours=n), "m": timedelta(minutes=n)}[unit]
+    return datetime.now(timezone.utc) - delta
+
+
+def to_dt(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def squash(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def strip_heredocs(cmd: str) -> str:
+    """<<EOF ... EOF の本文を落とす (本文中の単語をコマンドとして数えないため)。"""
+    out, skip_until = [], None
+    for line in cmd.splitlines():
+        if skip_until is not None:
+            if line.strip() == skip_until:
+                skip_until = None
+            continue
+        m = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
+        if m:
+            skip_until = m.group(1)
+        out.append(line)
+    return "\n".join(out)
+
+
+def split_simple_commands(body: str) -> list[str]:
+    """クォートの外側にある | || && ; 改行 ( ) で分割する (jq 式などの中身を割らない)。"""
+    segs, cur, quote, i = [], [], None, 0
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(body):
+                cur.append(body[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+        elif ch == "\\" and i + 1 < len(body):
+            cur.append(body[i + 1])
+            i += 1
+        elif ch in "|&;\n()":
+            segs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    segs.append("".join(cur))
+    return [x.strip() for x in segs if x.strip()]
+
+
+RE_HEAD_OK = re.compile(r"^[A-Za-z][A-Za-z0-9_.+-]*$")
+# 先頭語から剥がす wrapper とその引数の扱い
+WRAPPER_FLAG_WITH_VALUE = {"env": {"-u", "-C", "-S"}, "nice": {"-n"}, "timeout": {"-s", "-k", "--signal", "--kill-after"}}
+
+
+def command_heads(cmd: str) -> list[str]:
+    """シェルコマンド文字列を分割し、各単純コマンドの先頭語 (basename) を返す。"""
+    heads = []
+    for seg in split_simple_commands(strip_heredocs(cmd)):
+        toks = seg.split()
+        while toks:
+            t = toks[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", t):
+                toks.pop(0)
+                continue
+            if t not in CMD_WRAPPERS:
+                break
+            toks.pop(0)
+            with_value = WRAPPER_FLAG_WITH_VALUE.get(t, set())
+            while toks and toks[0].startswith("-"):
+                flag = toks.pop(0)
+                if flag in with_value and toks:
+                    toks.pop(0)
+            if t == "timeout" and toks:
+                toks.pop(0)  # duration
+            if t == "xargs":
+                break  # xargs 自体を数える (後続は引数)
+        if not toks:
+            continue
+        head = toks[0].split("/")[-1]
+        if head in CMD_SKIP or not RE_HEAD_OK.match(head):
+            continue
+        heads.append(head)
+    return heads
+
+
+def config_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(HOME / ".config")
+    return Path(base) / "agentlog" / "config.json"
+
+
+def load_tracked_commands(path: Path | None = None) -> dict:
+    """config.json の tracked_commands ({名前: 正規表現}) を読む。
+
+    hook から呼ばれるので、設定の不備では止めず stderr に出して無視する。
+    """
+    path = path or config_path()
+    try:
+        raw = json.loads(path.read_text())["tracked_commands"]
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"agentlog: {path} を読めません: {e}", file=sys.stderr)
+        return {}
+    tracked = {}
+    for name, pattern in raw.items() if isinstance(raw, dict) else ():
+        try:
+            tracked[name] = re.compile(pattern)
+        except (re.error, TypeError) as e:
+            print(f"agentlog: tracked_commands.{name} を無視します: {e}", file=sys.stderr)
+    return tracked
+
+
+TRACKED_COMMANDS = load_tracked_commands()
+
+
+class Acc:
+    """1 セッション分の集計器。Claude / Codex 両パーサが同じ形に詰める。"""
+
+    def __init__(self, agent: str):
+        self.agent = agent
+        self.session_id = None
+        self.parent_id = None
+        self.ts_min = self.ts_max = None
+        self.cwd = self.branch = None
+        self.models = Counter()
+        self.permission_mode = None
+        self.version = None
+        self.instruction = None
+        self.user_prompts = 0
+        self.turns = 0
+        self.tok = Counter()
+        self.final_context = 0
+        self.tools = Counter()
+        self.commands = Counter()
+        self.skills = []
+        self.tracked_commands = Counter()
+        self.files_edited = []
+        self.git_commits = []
+        self.refs = set()
+        self.subagents = 0
+        # 起動元の区別
+        #   user     : 人が対話で起動 (Claude cli / Codex tui・remote)
+        #   headless : 非対話起動 (codex exec など。スクリプトや他エージェントが呼ぶ形)
+        #   subagent : 組み込みの子 (Claude Agent ツール / Codex spawn_agent・review)
+        self.origin = None
+        self.launch_via = None  # 生の値 (Claude: entrypoint / Codex: originator)
+        self.launcher = None  # hook 経路で親エージェントが判明したとき (例: claude)
+
+    def touch(self, ts):
+        dt = to_dt(ts)
+        if not dt:
+            return
+        if self.ts_min is None or dt < self.ts_min:
+            self.ts_min = dt
+        if self.ts_max is None or dt > self.ts_max:
+            self.ts_max = dt
+
+    def see_command(self, cmd: str):
+        if not cmd:
+            return
+        for h in command_heads(cmd):
+            self.commands[h] += 1
+        for name, pattern in TRACKED_COMMANDS.items():
+            if pattern.search(cmd):
+                self.tracked_commands[name] += 1
+        if self.agent == "codex":  # Claude は Skill ツール呼出が正。ls/cat 等の誤検知を避ける
+            for m in RE_SKILL_MD.finditer(cmd):
+                self.add_skill(m.group(1))
+        self.see_refs(cmd)
+
+    def see_patch(self, patch: str):
+        """apply_patch 形式 (*** Update File: path) から編集ファイルを拾う。"""
+        for m in RE_PATCH_FILE.finditer(patch):
+            self.add_file(m.group(1).strip())
+
+    def see_refs(self, text: str):
+        if not text:
+            return
+        for m in RE_ISSUE.finditer(text):
+            self.refs.add("#" + next(g for g in m.groups() if g))
+        for m in RE_MR.finditer(text):
+            self.refs.add("!" + next(g for g in m.groups() if g))
+
+    def see_tool_output(self, text: str):
+        if not text:
+            return
+        for m in RE_GIT_COMMIT_OUT.finditer(text):
+            entry = squash(m.group(3), 120)
+            if entry not in self.git_commits:
+                self.git_commits.append(entry)
+                self.see_refs(entry)
+
+    def add_skill(self, name: str):
+        if name and name not in self.skills:
+            self.skills.append(name)
+
+    def add_file(self, path: str):
+        if path and path not in self.files_edited:
+            self.files_edited.append(path)
+
+    def set_instruction(self, text: str):
+        if self.instruction is None and text and text.strip():
+            self.instruction = squash(text, INSTRUCTION_LEN)
+            self.see_refs(text)
+        self.user_prompts += 1
+
+    def record(self, source: Path) -> dict:
+        if self.branch:
+            m = RE_BRANCH_NUM.match(self.branch)
+            if m:
+                self.refs.add("#" + m.group(1))
+        st = source.stat()
+        dur = (self.ts_max - self.ts_min).total_seconds() / 60 if self.ts_min and self.ts_max else None
+        return {
+            "schema": SCHEMA,
+            "agent": self.agent,
+            "session_id": self.session_id,
+            "parent_id": self.parent_id,
+            "started_at": self.ts_min.isoformat() if self.ts_min else None,
+            "ended_at": self.ts_max.isoformat() if self.ts_max else None,
+            "duration_min": round(dur, 1) if dur is not None else None,
+            "cwd": self.cwd,
+            "branch": self.branch,
+            "model": self.models.most_common(1)[0][0] if self.models else None,
+            "permission_mode": self.permission_mode,
+            "agent_version": self.version,
+            "instruction": self.instruction,
+            "user_prompts": self.user_prompts,
+            "turns": self.turns,
+            "tokens": {
+                "output": self.tok["output"],
+                "cache_creation": self.tok["cache_creation"],
+                "input": self.tok["input"],
+                "cache_read": self.tok["cache_read"],
+                "thinking": self.tok["thinking"],
+                "final_context": self.final_context,
+            },
+            "tools": dict(self.tools.most_common()),
+            "commands": dict(self.commands.most_common(TOP_COMMANDS)),
+            "skills": self.skills,
+            "tracked_commands": dict(self.tracked_commands),
+            "files_edited": self.files_edited,
+            "git_commits": self.git_commits,
+            "refs": sorted(self.refs),
+            "subagents": self.subagents,
+            "origin": self.origin,
+            "launch_via": self.launch_via,
+            "launcher": self.launcher,
+            "source": str(source),
+            "source_mtime": int(st.st_mtime),
+            "source_size": st.st_size,
+            "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+
+
+# ---------------------------------------------------------------- Claude Code
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            c.get("text", "") if isinstance(c, dict) and c.get("type") == "text" else ""
+            for c in content
+        )
+    return ""
+
+
+def _claude_user_text(content) -> str | None:
+    """ユーザーが実際に打った文だけ返す。slash command の展開や tool_result は None。"""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        if any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+            return None
+        text = _text_of(content)
+    else:
+        return None
+    text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.S).strip()
+    if not text or text.startswith("<"):
+        return None
+    return text
+
+
+def parse_claude(path: Path, parent_id: str | None = None) -> dict:
+    acc = Acc("claude")
+    acc.parent_id = parent_id
+    seen_msgs = set()
+    for rec in iter_jsonl(path):
+        typ = rec.get("type")
+        if typ == "permission-mode":
+            acc.permission_mode = rec.get("permissionMode")
+            continue
+        if typ not in ("user", "assistant"):
+            continue
+        acc.session_id = acc.session_id or rec.get("sessionId")
+        acc.cwd = acc.cwd or rec.get("cwd")
+        acc.branch = acc.branch or rec.get("gitBranch")
+        acc.version = acc.version or rec.get("version")
+        acc.launch_via = acc.launch_via or rec.get("entrypoint")
+        if rec.get("isSidechain"):
+            acc.origin = "subagent"
+        acc.touch(rec.get("timestamp"))
+        msg = rec.get("message") or {}
+        if typ == "user":
+            if rec.get("isMeta"):
+                continue
+            content = msg.get("content")
+            text = _claude_user_text(content)
+            if text is not None:
+                acc.set_instruction(text)
+                continue
+            # tool_result: git commit 出力の抽出
+            tur = rec.get("toolUseResult")
+            out = ""
+            if isinstance(tur, dict):
+                out = str(tur.get("stdout") or "")
+            elif isinstance(tur, str):
+                out = tur
+            if not out and isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_result":
+                        cc = c.get("content")
+                        out += cc if isinstance(cc, str) else _text_of(cc)
+            acc.see_tool_output(out)
+            continue
+        # assistant: 1 応答が複数行 (apiBlockIndex) に割れるので message.id で重複排除
+        mid = msg.get("id") or rec.get("requestId") or rec.get("uuid")
+        if mid not in seen_msgs:
+            seen_msgs.add(mid)
+            acc.turns += 1
+            if msg.get("model"):
+                acc.models[msg["model"]] += 1
+            u = msg.get("usage") or {}
+            if u:
+                inp = u.get("input_tokens", 0)
+                cc = u.get("cache_creation_input_tokens", 0)
+                cr = u.get("cache_read_input_tokens", 0)
+                acc.tok["input"] += inp
+                acc.tok["cache_creation"] += cc
+                acc.tok["cache_read"] += cr
+                acc.tok["output"] += u.get("output_tokens", 0)
+                acc.tok["thinking"] += (u.get("output_tokens_details") or {}).get("thinking_tokens", 0)
+                acc.final_context = inp + cc + cr
+        for c in msg.get("content") or []:
+            if not isinstance(c, dict) or c.get("type") != "tool_use":
+                continue
+            name = c.get("name") or "?"
+            inp = c.get("input") or {}
+            acc.tools[name] += 1
+            if name == "Bash":
+                acc.see_command(str(inp.get("command", "")))
+            elif name == "Skill":
+                acc.add_skill(str(inp.get("skill", "")))
+            elif name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+                acc.add_file(str(inp.get("file_path") or inp.get("notebook_path") or ""))
+            elif name == "Agent":
+                acc.subagents += 1
+    if not acc.session_id:
+        acc.session_id = path.stem
+    if parent_id:
+        acc.origin = "subagent"
+    if acc.origin is None:
+        # 2026-09-08 時点で観測した entrypoint は "cli" のみ。claude -p の値は未確認なので
+        # cli 以外が現れたら headless に寄せて launch_via で生値を残す
+        acc.origin = "user" if acc.launch_via in (None, "cli") else "headless"
+    return acc.record(path)
+
+
+def claude_subagent_files(transcript: Path) -> list[Path]:
+    d = transcript.with_suffix("") / "subagents"
+    return sorted(d.glob("*.jsonl")) if d.is_dir() else []
+
+
+# ---------------------------------------------------------------- Codex
+
+
+RE_JS_STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+
+
+def _codex_cmds(payload: dict) -> tuple[list[str], list[str]]:
+    """ツール呼出からシェルコマンド文字列と apply_patch 本文を取り出す。"""
+    cmds, patches = [], []
+    name = payload.get("name") or ""
+    raw = payload.get("input")
+    if raw is None:
+        raw = payload.get("arguments")
+    args = None
+    if isinstance(raw, dict):
+        args = raw
+    elif isinstance(raw, str) and raw.lstrip().startswith("{"):
+        try:
+            args = json.loads(raw)
+        except json.JSONDecodeError:
+            args = None
+    if isinstance(args, dict):
+        for key in ("cmd", "command"):
+            v = args.get(key)
+            if isinstance(v, list):
+                cmds.append(" ".join(str(x) for x in v))
+            elif isinstance(v, str):
+                cmds.append(v)
+        if name == "apply_patch" and isinstance(args.get("input"), str):
+            patches.append(args["input"])
+    elif isinstance(raw, str):
+        if raw.lstrip().startswith("*** Begin Patch"):
+            patches.append(raw)
+            return cmds, patches
+        # code-mode: JS ソースの中に {"cmd":"..."} や const patch = "*** Begin Patch..." が埋まる
+        for m in RE_CODEX_CMD.finditer(raw):
+            try:
+                cmds.append(json.loads(m.group(1)))
+            except json.JSONDecodeError:
+                pass
+        for m in RE_JS_STRING.finditer(raw):
+            lit = m.group(0)
+            if not lit.startswith('"*** Begin Patch'):
+                continue
+            try:
+                patches.append(json.loads(lit))
+            except json.JSONDecodeError:
+                pass
+    return cmds, patches
+
+
+def parse_codex(path: Path) -> dict:
+    acc = Acc("codex")
+    last_total = None
+    usage_records = 0
+    for rec in iter_jsonl(path):
+        typ = rec.get("type")
+        payload = rec.get("payload") or {}
+        acc.touch(rec.get("timestamp"))
+        if typ == "session_meta":
+            acc.session_id = payload.get("id") or payload.get("session_id")
+            acc.cwd = payload.get("cwd")
+            acc.version = payload.get("cli_version")
+            acc.branch = (payload.get("git") or {}).get("branch")
+            acc.launch_via = payload.get("originator")
+            src = payload.get("source")
+            if isinstance(src, dict):
+                sub = src.get("subagent")
+                spawn = (sub.get("thread_spawn") or {}) if isinstance(sub, dict) else {}
+                acc.parent_id = spawn.get("parent_thread_id")
+            if payload.get("thread_source") == "subagent" or (isinstance(src, dict) and "subagent" in src):
+                acc.origin = "subagent"
+            elif acc.launch_via == "codex_exec":
+                acc.origin = "headless"
+            else:
+                acc.origin = "user"
+            continue
+        if typ == "turn_context":
+            if payload.get("model"):
+                acc.models[payload["model"]] += 1
+            ap = payload.get("approval_policy")
+            sb = (payload.get("sandbox_policy") or {}).get("type")
+            if ap or sb:
+                acc.permission_mode = f"{ap}/{sb}"
+            continue
+        if typ == "token_usage_record":
+            u = payload.get("usage") or {}
+            usage_records += 1
+            inp, cached = u.get("input_tokens", 0), u.get("cached_input_tokens", 0)
+            acc.tok["input"] += max(inp - cached, 0)
+            acc.tok["cache_read"] += cached
+            acc.tok["cache_creation"] += u.get("cache_write_input_tokens", 0)
+            acc.tok["output"] += u.get("output_tokens", 0)
+            acc.tok["thinking"] += u.get("reasoning_output_tokens", 0)
+            acc.final_context = inp
+            continue
+        if typ == "event_msg" and payload.get("type") == "token_count":
+            last_total = (payload.get("info") or {}).get("total_token_usage") or last_total
+            continue
+        if typ == "event_msg" and payload.get("type") == "item_completed":
+            item = payload.get("item") or {}
+            if item.get("type") == "CommandExecution":
+                acc.see_tool_output(str(item.get("aggregated_output") or item.get("stdout") or ""))
+            continue
+        if typ != "response_item":
+            continue
+        ptype = payload.get("type")
+        if ptype == "message":
+            if payload.get("role") == "user":
+                texts = [c.get("text", "") for c in payload.get("content") or [] if isinstance(c, dict)]
+                for t in texts:
+                    t = t.strip()
+                    if t and not t.startswith(("<", "# AGENTS.md")):
+                        acc.set_instruction(t)
+                        break
+            elif payload.get("role") == "assistant":
+                acc.turns += 1
+        elif ptype in ("function_call", "custom_tool_call"):
+            name = payload.get("name") or "?"
+            acc.tools[name] += 1
+            if name == "spawn_agent":
+                acc.subagents += 1
+            cmds, patches = _codex_cmds(payload)
+            for cmd in cmds:
+                acc.see_command(cmd)
+            for patch in patches:
+                acc.see_patch(patch)
+        elif ptype in ("function_call_output", "custom_tool_call_output"):
+            out = payload.get("output")
+            if isinstance(out, list):
+                out = "\n".join(str(c.get("text", "")) for c in out if isinstance(c, dict))
+            if isinstance(out, dict):
+                out = out.get("output") or json.dumps(out, ensure_ascii=False)
+            if isinstance(out, str) and out.lstrip().startswith("{"):
+                try:
+                    j = json.loads(out)
+                    out = j.get("output", out) if isinstance(j, dict) else out
+                except json.JSONDecodeError:
+                    pass
+            acc.see_tool_output(str(out or ""))
+    # token_usage_record が無い古い形式は累積値で代替
+    if usage_records == 0 and last_total:
+        inp, cached = last_total.get("input_tokens", 0), last_total.get("cached_input_tokens", 0)
+        acc.tok["input"] = max(inp - cached, 0)
+        acc.tok["cache_read"] = cached
+        acc.tok["cache_creation"] = last_total.get("cache_write_input_tokens", 0)
+        acc.tok["output"] = last_total.get("output_tokens", 0)
+        acc.tok["thinking"] = last_total.get("reasoning_output_tokens", 0)
+        acc.final_context = inp
+    if usage_records:
+        acc.turns = usage_records
+    if not acc.session_id:
+        m = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})", path.name)
+        acc.session_id = m.group(1) if m else path.stem
+    return acc.record(path)
+
+
+# ---------------------------------------------------------------- ストア
+
+
+def detect_agent(path: Path) -> str | None:
+    s = str(path)
+    if "/.codex/" in s or path.name.startswith("rollout-"):
+        return "codex"
+    if "/.claude/" in s:
+        return "claude"
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        head = fh.read(400)
+    if '"session_meta"' in head or '"payload"' in head:
+        return "codex"
+    if '"sessionId"' in head:
+        return "claude"
+    return None
+
+
+def collect_path(path: Path, launcher: str | None = None) -> list[dict]:
+    agent = detect_agent(path)
+    if agent == "codex":
+        rec = parse_codex(path)
+        if launcher:
+            rec["launcher"] = launcher
+        return [rec]
+    if agent == "claude":
+        recs = [parse_claude(path)]
+        for sub in claude_subagent_files(path):
+            r = parse_claude(sub, parent_id=recs[0]["session_id"])
+            r["session_id"] = f"{recs[0]['session_id']}/{sub.stem}"
+            recs.append(r)
+        return recs
+    log(f"形式を判別できないため skip: {path}")
+    return []
+
+
+def load_store() -> list[dict]:
+    if not STORE.exists():
+        return []
+    return list(iter_jsonl(STORE))
+
+
+def save_store(records: list[dict]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STORE.with_suffix(".jsonl.tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp.replace(STORE)
+
+
+def upsert(new: list[dict]) -> int:
+    store = load_store()
+    index = {(r.get("agent"), r.get("session_id")): i for i, r in enumerate(store)}
+    n = 0
+    for r in new:
+        key = (r["agent"], r["session_id"])
+        if key in index:
+            store[index[key]] = r
+        else:
+            index[key] = len(store)
+            store.append(r)
+        n += 1
+    store.sort(key=lambda r: r.get("started_at") or "")
+    save_store(store)
+    return n
+
+
+def is_stale(store_index: dict, path: Path) -> bool:
+    """既に同じ mtime/size で集計済みなら False。"""
+    st = path.stat()
+    for r in store_index.get(str(path), []):
+        if r.get("source_mtime") == int(st.st_mtime) and r.get("source_size") == st.st_size:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------- サブコマンド
+
+
+def cmd_collect(args) -> int:
+    recs = []
+    for p in args.paths:
+        path = Path(p).expanduser()
+        if not path.is_file():
+            log(f"見つからない: {path}")
+            continue
+        recs.extend(collect_path(path))
+    if args.stdout:
+        for r in recs:
+            print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+    n = upsert(recs)
+    log(f"{n} 件を {STORE} に書き込み")
+    return 0
+
+
+def cmd_scan(args) -> int:
+    since = parse_since(args.since)
+    cutoff = since.timestamp() if since else 0
+    by_source: dict[str, list[dict]] = {}
+    for r in load_store():
+        by_source.setdefault(r.get("source", ""), []).append(r)
+    targets = []
+    if not args.codex_only and CLAUDE_PROJECTS.is_dir():
+        for p in CLAUDE_PROJECTS.glob("*/*.jsonl"):
+            if p.stat().st_mtime >= cutoff:
+                targets.append(p)
+    if not args.claude_only and CODEX_SESSIONS.is_dir():
+        for p in CODEX_SESSIONS.rglob("rollout-*.jsonl"):
+            if p.stat().st_mtime >= cutoff:
+                targets.append(p)
+    recs = []
+    for p in sorted(targets):
+        if not args.force and not is_stale(by_source, p):
+            continue
+        try:
+            recs.extend(collect_path(p))
+        except Exception as e:  # noqa: BLE001 - 1 ファイルの破損で全体を止めない
+            log(f"parse 失敗 {p}: {e}")
+    if recs:
+        upsert(recs)
+    log(f"走査 {len(targets)} ファイル / 更新 {len(recs)} レコード -> {STORE}")
+    return 0
+
+
+def cmd_hook(args) -> int:
+    """SessionEnd hook。何があっても exit 0 (エージェントの終了を妨げない)。"""
+    try:
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+    tp = data.get("transcript_path")
+    sid = data.get("session_id")
+    path = Path(tp).expanduser() if tp else None
+    if (path is None or not path.is_file()) and sid:
+        # transcript_path が無い/違う場合は session_id でファイルを探す
+        hits = list(CLAUDE_PROJECTS.glob(f"*/{sid}.jsonl")) + list(CODEX_SESSIONS.rglob(f"rollout-*{sid}.jsonl"))
+        path = hits[0] if hits else None
+    if path is None or not path.is_file():
+        log("transcript が見つからないため何もしない")
+        return 0
+    # Codex が Claude の Bash から起動されていれば、hook はその環境 (CLAUDECODE=1) を引き継ぐ。
+    # Claude 自身の hook でも CLAUDECODE=1 は立つので、Codex レコードにだけ意味を持たせる
+    launcher = "claude" if os.environ.get("CLAUDECODE") else None
+    try:
+        recs = collect_path(path, launcher=launcher)
+        upsert(recs)
+        if args.verbose:
+            log(f"{len(recs)} 件を記録 ({path.name})")
+    except Exception as e:  # noqa: BLE001
+        log(f"hook 失敗: {e}")
+    return 0
+
+
+def _k(n: int | None) -> str:
+    if n is None:
+        return "-"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def _local(ts: str | None) -> str:
+    dt = to_dt(ts)
+    return dt.astimezone().strftime("%m-%d %H:%M") if dt else "-"
+
+
+def filtered(args) -> list[dict]:
+    since = parse_since(args.since)
+    out = []
+    for r in load_store():
+        if args.agent and r.get("agent") != args.agent:
+            continue
+        if since and (to_dt(r.get("started_at")) or datetime.min.replace(tzinfo=timezone.utc)) < since:
+            continue
+        if getattr(args, "no_sub", False) and (r.get("parent_id") or r.get("origin") == "subagent"):
+            continue
+        if getattr(args, "origin", None) and r.get("origin") != args.origin:
+            continue
+        out.append(r)
+    return out
+
+
+def cmd_show(args) -> int:
+    recs = filtered(args)
+    if args.limit:
+        recs = recs[-args.limit :]
+    if args.json:
+        for r in recs:
+            print(json.dumps(r, ensure_ascii=False))
+        return 0
+    if not recs:
+        print("記録なし (agentlog scan で取り込めます)")
+        return 0
+    hdr = f"{'start':<11} {'agent':<6} {'origin':<8} {'min':>5} {'turns':>5} {'out':>7} {'ctx':>7} {'branch':<22} {'tools':<24} instruction"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in recs:
+        t = r.get("tokens") or {}
+        tools = ",".join(f"{k}:{v}" for k, v in list((r.get("tools") or {}).items())[:3])
+        tag = "↳" if r.get("parent_id") else ""
+        origin = r.get("origin") or "-"
+        if r.get("launcher"):
+            origin += "<" + r["launcher"]
+        print(
+            f"{_local(r.get('started_at')):<11} {r.get('agent', '?'):<6} {origin:<8} {str(r.get('duration_min', '-')):>5} "
+            f"{r.get('turns', 0):>5} {_k(t.get('output')):>7} {_k(t.get('final_context')):>7} "
+            f"{squash(r.get('branch') or '-', 22):<22} {squash(tools, 24):<24} {tag}{squash(r.get('instruction') or '-', 60)}"
+        )
+    return 0
+
+
+def cmd_stats(args) -> int:
+    recs = filtered(args)
+    if not recs:
+        print("記録なし")
+        return 0
+    by_agent: dict[str, list[dict]] = {}
+    for r in recs:
+        by_agent.setdefault(r.get("agent", "?"), []).append(r)
+    for agent, rs in sorted(by_agent.items()):
+        tok = Counter()
+        tools, cmds, skills = Counter(), Counter(), Counter()
+        commits = 0
+        tracked = Counter()
+        for r in rs:
+            for k, v in (r.get("tokens") or {}).items():
+                if k != "final_context":
+                    tok[k] += v
+            tools.update(r.get("tools") or {})
+            cmds.update(r.get("commands") or {})
+            skills.update(r.get("skills") or [])
+            tracked.update(r.get("tracked_commands") or {})
+            commits += len(r.get("git_commits") or [])
+        origins = Counter((r.get("origin") or "-") + ("<" + r["launcher"] if r.get("launcher") else "") for r in rs)
+        print(f"## {agent}: {len(rs)} sessions, {sum(r.get('turns', 0) for r in rs)} turns, {commits} commits")
+        if tracked:
+            print("  tracked:  " + ", ".join(f"{k} {v}" for k, v in tracked.most_common()))
+        print("  origin:   " + ", ".join(f"{k} {v}" for k, v in origins.most_common()))
+        print(
+            "  tokens: output %s / cache_creation %s / input %s / cache_read %s / thinking %s"
+            % tuple(_k(tok[k]) for k in ("output", "cache_creation", "input", "cache_read", "thinking"))
+        )
+        print("  tools:    " + ", ".join(f"{k} {v}" for k, v in tools.most_common(12)))
+        print("  commands: " + ", ".join(f"{k} {v}" for k, v in cmds.most_common(15)))
+        if skills:
+            print("  skills:   " + ", ".join(f"{k} {v}" for k, v in skills.most_common(10)))
+    return 0
+
+
+def _merge_hook(settings: dict, event: str, with_matcher: bool) -> bool:
+    hooks = settings.setdefault("hooks", {})
+    entries = hooks.setdefault(event, [])
+    for e in entries:
+        for h in e.get("hooks", []):
+            if "agentlog hook" in str(h.get("command", "")):
+                return False
+    entry = {"hooks": [{"type": "command", "command": HOOK_COMMAND, "timeout": 30}]}
+    if with_matcher:
+        entry = {"matcher": "*", **entry}
+    entries.append(entry)
+    return True
+
+
+def cmd_install_hook(args) -> int:
+    targets = [
+        (HOME / ".claude/settings.json", True),
+        (HOME / ".codex/hooks.json", False),
+    ]
+    for path, with_matcher in targets:
+        if not path.parent.is_dir():
+            log(f"skip (ディレクトリなし): {path}")
+            continue
+        settings = {}
+        if path.exists():
+            try:
+                settings = json.loads(path.read_text(encoding="utf-8") or "{}")
+            except json.JSONDecodeError as e:
+                log(f"skip (JSON 不正): {path}: {e}")
+                continue
+        changed = _merge_hook(settings, "SessionEnd", with_matcher)
+        if not changed:
+            log(f"既に登録済み: {path}")
+            continue
+        if args.dry_run:
+            log(f"[dry-run] SessionEnd hook を追記: {path}")
+            continue
+        if path.exists():
+            shutil.copy2(path, path.with_suffix(path.suffix + f".bak-{time.strftime('%Y%m%d%H%M%S')}"))
+        path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        log(f"SessionEnd hook を登録: {path}")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="agentlog", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sp.add_parser("hook", help="SessionEnd hook (stdin に hook JSON)")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(fn=cmd_hook)
+
+    p = sp.add_parser("collect", help="transcript を指定して集計")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--stdout", action="store_true", help="保存せず JSON を表示")
+    p.set_defaults(fn=cmd_collect)
+
+    p = sp.add_parser("scan", help="両エージェントの transcript を走査")
+    p.add_argument("--since", default="7d", help="mtime の下限 (例: 7d, 12h, 2026-09-01)")
+    p.add_argument("--claude", dest="claude_only", action="store_true")
+    p.add_argument("--codex", dest="codex_only", action="store_true")
+    p.add_argument("--force", action="store_true", help="集計済みでも再集計する (schema 更新後など)")
+    p.set_defaults(fn=cmd_scan)
+
+    for name, fn in (("show", cmd_show), ("stats", cmd_stats)):
+        p = sp.add_parser(name, help="記録を表示" if name == "show" else "期間集計")
+        p.add_argument("--since", default="7d" if name == "show" else "30d")
+        p.add_argument("--agent", choices=("claude", "codex"))
+        p.add_argument("--no-sub", dest="no_sub", action="store_true", help="サブエージェントを除く")
+        p.add_argument("--origin", choices=("user", "headless", "subagent"), help="起動元で絞る")
+        if name == "show":
+            p.add_argument("--json", action="store_true")
+            p.add_argument("-n", "--limit", type=int, default=30)
+        p.set_defaults(fn=fn)
+
+    p = sp.add_parser("install-hook", help="SessionEnd hook を settings に登録")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_install_hook)
+
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
