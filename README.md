@@ -1,49 +1,51 @@
-# agentlog 📈 — AI エージェントのセッション計測
+# agentlog 📈💅 — session metrics for AI agents
 
-Claude Code と Codex が残す transcript をセッション終了時に 1 回読み、1 セッション 1 行の jsonl に集約するよ。
-LLM による要約はしないので、計測のためにセッション本体のトークンは増えない 🪶
+**English** | [日本語](README.ja.md)
 
-- 実体: `agentlog` の 1 ファイル (Python 3.9 以上、標準ライブラリのみ)
-- 保存先: `~/.local/share/agentlog/sessions.jsonl` (Git 管理外)
+agentlog reads the transcripts that Claude Code and Codex leave behind, once when each session ends, and squishes them into a jsonl file with one line per session 💖✨  
+It doesn't use an LLM to summarize anything, sooo measuring adds zero tokens to your actual sessions 🪶
 
-## 📦 導入
+- 🐍 What it is: a single file, `agentlog` (Python 3.9+, standard library only)
+- 💾 Where it saves: `~/.local/share/agentlog/sessions.jsonl` (not tracked by Git)
+
+## 📦 Install
 
 ```sh
 install -m 755 agentlog ~/.local/bin/agentlog
 ```
 
-hook は `~/.local/bin/agentlog` を呼ぶので、この場所に置いてね。
+The hook calls `~/.local/bin/agentlog`, so put it right there okay? 🙏
 
-## 🚀 使い方
+## 🚀 Usage
 
 ```sh
-agentlog install-hook          # ~/.claude/settings.json と ~/.codex/hooks.json に SessionEnd hook を冪等登録 (初回のみ)
-agentlog scan --since 7d       # hook を入れる前のセッションや取りこぼしを transcript から取り込む
-agentlog show --since 7d       # 一覧 (開始時刻 / 起動元 / 所要分 / ターン数 / 出力トークン / 最終コンテキスト / ツール / 指示)
-agentlog stats --since 30d     # 期間集計 (トークン 4 区分・起動元・ツール・原始コマンド・skills)
-agentlog show --json | jq ...  # 生レコード
+agentlog install-hook          # idempotently register a SessionEnd hook in ~/.claude/settings.json and ~/.codex/hooks.json (first time only)
+agentlog scan --since 7d       # import sessions from before the hook, or ones it missed, from transcripts
+agentlog show --since 7d       # list (start time / origin / minutes / turns / output tokens / final context / tools / prompt)
+agentlog stats --since 30d     # totals for a period (4 token kinds, origins, tools, primitive commands, skills)
+agentlog show --json | jq ...  # raw records
 ```
 
-絞り込み: `--agent claude|codex` / `--origin user|headless|subagent` / `--no-sub` 🔍
-schema を更新したら `agentlog scan --since 30d --force` で再集計 🔁
+Filters: `--agent claude|codex` / `--origin user|headless|subagent` / `--no-sub` 🔍  
+Updated the schema? Recount with `agentlog scan --since 30d --force` 🔁
 
-## 📝 記録する項目
+## 📝 What gets recorded
 
-| 項目 | 中身 |
+| Field | Contents |
 |---|---|
-| 指示 | 最初のユーザー入力の先頭 200 字 |
-| 成果 | `git commit` のメッセージ、編集したファイル |
-| トークン | output / cache_creation / input / cache_read / thinking / 最終コンテキスト |
-| ツール | ツール名ごとの呼出回数 (Bash / Read / Edit / LSP / mcp__* ...) |
-| 原始コマンド | シェルの先頭コマンド頻度 (grep / sed / awk / jq ...) |
-| skills | 呼んだ Skill 名 |
-| 追跡コマンド | `config.json` で指定した正規表現に一致したコマンドの回数 |
-| 関連 | issue / MR 番号 (ブランチ名・glab コマンド・コミットメッセージから) |
-| 構造 | サブエージェント数、`parent_id` |
+| Prompt | First 200 characters of the first user input |
+| Results | `git commit` messages, edited files |
+| Tokens | output / cache_creation / input / cache_read / thinking / final context |
+| Tools | Call count per tool name (Bash / Read / Edit / LSP / mcp__* ...) |
+| Primitive commands | How often each leading shell command shows up (grep / sed / awk / jq ...) |
+| skills | Names of the Skills that were invoked |
+| Tracked commands | Count of commands matching the regexes in `config.json` |
+| Related | issue / MR numbers (from branch names, glab commands, commit messages) |
+| Structure | Number of subagents, `parent_id` |
 
-## ⚙️ 設定
+## ⚙️ Config
 
-特定のコマンドの呼び出し回数を数えたいときは、`~/.config/agentlog/config.json` (`XDG_CONFIG_HOME` に従う) に名前と正規表現を書くよ。
+Wanna count how many times some specific command runs? Write a name and a regex in `~/.config/agentlog/config.json` (follows `XDG_CONFIG_HOME`) 💡
 
 ```json
 {
@@ -53,28 +55,28 @@ schema を更新したら `agentlog scan --since 30d --force` で再集計 🔁
 }
 ```
 
-回数はレコードの `tracked_commands` に入り、`agentlog stats` の `tracked:` 行に出る。
-設定ファイルが無ければ何も数えない。
+The counts go into the record's `tracked_commands`, and show up on the `tracked:` line of `agentlog stats` 📊  
+No config file means nothing gets counted.
 
-## 🧭 起動元 (origin)
+## 🧭 Origin
 
-人が起動したものとエージェントが起こしたものを分けて見られるよ 👀
+You can tell apart sessions a human started from ones an agent kicked off 👀
 
-| origin | 意味 |
+| origin | Meaning |
 |---|---|
-| `user` | 人が対話で起動 (Claude の cli、Codex の tui / remote) |
-| `headless` | 非対話起動 (`codex exec` など)。スクリプトや他エージェントが呼ぶ形 |
-| `subagent` | Claude の Agent ツール / Codex の spawn_agent が起こした子。`parent_id` が親を指す |
+| `user` | Started interactively by a human (Claude's cli, Codex's tui / remote) |
+| `headless` | Started non-interactively (`codex exec`, etc.). Called by a script or another agent |
+| `subagent` | A child spawned by Claude's Agent tool / Codex's spawn_agent. `parent_id` points to the parent |
 
-Codex が Claude の Bash から起動されたときは、hook が `CLAUDECODE=1` を見て `launcher: claude` を付ける (scan 経路では取れない) 🔗
+When Codex is launched from Claude's Bash, the hook sees `CLAUDECODE=1` and adds `launcher: claude` (the scan path can't pick this up) 🔗
 
-## ⚠️ 知っておくこと
+## ⚠️ Good to know
 
-- git commit は `[branch hash] message` の出力から拾うので、`git commit -q` で抑止されたものは数えない
-- Codex の skills は `skills/<name>/SKILL.md` を読んだコマンドから推定 (Claude は Skill ツール呼出が正)
-- Codex 側の SessionEnd hook は、実バイナリに `SessionEnd` / `transcript_path` の文字列があることだけ確認済み (2026-09-08)。取りこぼしは `agentlog scan` で埋まる
-- Claude の `entrypoint` は 2026-09-08 時点で `cli` しか観測していない。別の値が来たら `headless` に寄せ、生値を `launch_via` に残す
+- git commits are picked up from the `[branch hash] message` output, so ones silenced with `git commit -q` aren't counted
+- Codex skills are guessed from commands that read `skills/<name>/SKILL.md` (for Claude, Skill tool calls are the source of truth)
+- For Codex's SessionEnd hook, the only thing confirmed is that the real binary contains the strings `SessionEnd` / `transcript_path` (2026-09-08). Anything it misses gets filled in by `agentlog scan`
+- As of 2026-09-08, Claude's `entrypoint` has only ever been seen as `cli`. If some other value shows up, it's folded into `headless` and the raw value is kept in `launch_via`
 
-## ライセンス
+## 📜 License
 
-MIT
+MIT 💖
